@@ -5,7 +5,7 @@ module.exports = async function handler(req, res) {
   if (!process.env.YOUTUBE_API_KEY) return res.json({ items: [], noKey: true });
 
   try {
-    const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(q)}&type=video&maxResults=12&key=${process.env.YOUTUBE_API_KEY}`;
+    const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(q)}&type=video&videoEmbeddable=true&maxResults=12&key=${process.env.YOUTUBE_API_KEY}`;
     const r = await fetch(url);
     const data = await r.json();
     res.json(data);
