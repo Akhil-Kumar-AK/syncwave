@@ -1,19 +1,52 @@
 'use strict';
 
 // ===== INIT STATE =====
-const socket = io();
 const urlParams = new URLSearchParams(window.location.search);
 const IS_CREATING = urlParams.get('create') === 'true';
 let ROOM_ID = (urlParams.get('id') || '').toUpperCase();
 
-let myId = null;
+// Persistent user ID for Pusher presence (same tab session)
+let myUserId = sessionStorage.getItem('syncwave_user_id');
+if (!myUserId) {
+  myUserId = (typeof crypto !== 'undefined' && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : Math.random().toString(36).slice(2) + Date.now().toString(36);
+  sessionStorage.setItem('syncwave_user_id', myUserId);
+}
+
 let myName = sessionStorage.getItem('syncwave_username') || '';
 let currentPlatform = 'youtube';
-let serverConfig = { spotifyEnabled: false, appleEnabled: false, youtubeSearchEnabled: false };
+let serverConfig = { spotifyEnabled: false, appleEnabled: false, youtubeSearchEnabled: false, pusherKey: '', pusherCluster: 'us2' };
+
+// Pusher
+let pusher = null;
+let channel = null;
 
 // Playback sync state
 let isSyncing = false;
-let pendingSyncState = null;  // stored when autoplay is blocked
+let pendingSyncState = null;
+
+// Per-user dynamic state (voice, speaking)
+const userStates = new Map();
+
+// ===== SEND EVENT TO SERVER (replaces socket.emit) =====
+async function emitEvent(event, data) {
+  try {
+    await fetch('/api/events', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        roomId: ROOM_ID,
+        event,
+        data,
+        socketId: pusher?.connection?.socket_id
+      })
+    });
+  } catch (e) {
+    console.error('emitEvent error:', e);
+  }
+}
+
 
 // ===== AVATAR COLORS =====
 const COLORS = [
@@ -67,8 +100,6 @@ document.querySelectorAll('.modal-overlay').forEach(o => o.addEventListener('cli
 document.querySelectorAll('.modal-close').forEach(b => b.addEventListener('click', () => closeModal(b.dataset.close)));
 
 // ===== SYNC OVERLAY =====
-// Chrome/Safari block autoplay triggered by socket events (no user gesture).
-// We detect blocked autoplay and show this overlay so the user can click once.
 function showSyncOverlay(state) {
   pendingSyncState = state;
   document.getElementById('sync-overlay').style.display = 'flex';
@@ -82,14 +113,9 @@ document.getElementById('sync-now-btn').addEventListener('click', () => {
   const state = pendingSyncState;
   hideSyncOverlay();
   if (!state) return;
-
-  if (currentPlatform === 'youtube') {
-    applyYTState(state, true /* forced by user gesture */);
-  } else if (currentPlatform === 'spotify') {
-    applySpotifyState(state, true);
-  } else if (currentPlatform === 'apple') {
-    applyAppleState(state, true);
-  }
+  if (currentPlatform === 'youtube') applyYTState(state, true);
+  else if (currentPlatform === 'spotify') applySpotifyState(state, true);
+  else if (currentPlatform === 'apple') applyAppleState(state, true);
 });
 
 
@@ -125,12 +151,12 @@ function onYTStateChange(event) {
     isPlaying = true;
     updatePlayBtn(true);
     setWaveform(true);
-    socket.emit('player-state', { platform: 'youtube', isPlaying: true, currentTime: ytPlayer.getCurrentTime(), lastUpdated: Date.now() });
+    emitEvent('player-state', { platform: 'youtube', isPlaying: true, currentTime: ytPlayer.getCurrentTime(), lastUpdated: Date.now() });
   } else if (s === YT.PlayerState.PAUSED) {
     isPlaying = false;
     updatePlayBtn(false);
     setWaveform(false);
-    socket.emit('player-state', { platform: 'youtube', isPlaying: false, currentTime: ytPlayer.getCurrentTime(), lastUpdated: Date.now() });
+    emitEvent('player-state', { platform: 'youtube', isPlaying: false, currentTime: ytPlayer.getCurrentTime(), lastUpdated: Date.now() });
   } else if (s === YT.PlayerState.ENDED) {
     isPlaying = false;
     updatePlayBtn(false);
@@ -150,8 +176,6 @@ function applyYTState(state, forcedGesture = false) {
     ytPlayer.seekTo(target, true);
     ytPlayer.playVideo();
 
-    // After 1.5s, check if browser actually started playing.
-    // If not → autoplay was blocked → show sync overlay.
     if (!forcedGesture) {
       setTimeout(() => {
         try {
@@ -203,7 +227,6 @@ function startSeekbarTick() {
   }, 500);
 }
 
-// YouTube controls
 document.getElementById('play-pause-btn').addEventListener('click', () => {
   if (currentPlatform === 'youtube') {
     if (!ytPlayer || !ytReady) return;
@@ -250,7 +273,7 @@ document.getElementById('seekbar').addEventListener('change', function() {
     isSyncing = true;
     ytPlayer.seekTo(t, true);
     setTimeout(() => { isSyncing = false; }, 300);
-    socket.emit('player-state', { platform: 'youtube', isPlaying, currentTime: t, lastUpdated: Date.now() });
+    emitEvent('player-state', { platform: 'youtube', isPlaying, currentTime: t, lastUpdated: Date.now() });
   }
 });
 
@@ -259,7 +282,7 @@ document.getElementById('prev-btn').addEventListener('click', () => {
     isSyncing = true;
     ytPlayer.seekTo(0, true);
     setTimeout(() => { isSyncing = false; }, 300);
-    socket.emit('player-state', { platform: 'youtube', isPlaying, currentTime: 0, lastUpdated: Date.now() });
+    emitEvent('player-state', { platform: 'youtube', isPlaying, currentTime: 0, lastUpdated: Date.now() });
   }
 });
 document.getElementById('next-btn').addEventListener('click', () => playNextInQueue());
@@ -280,11 +303,7 @@ function setWaveform(playing) {
 
 
 // ===================================================
-// ===== SPOTIFY — PKCE FLOW (no Client Secret needed) =====
-// ===================================================
-// PKCE = Proof Key for Code Exchange. Spotify recommends this for browser apps.
-// No client_secret required. Redirect URI: http://localhost:3000/callback.html
-// Spotify explicitly allows http://localhost as redirect URI.
+// ===== SPOTIFY — PKCE FLOW =====
 // ===================================================
 let spotifyPlayer    = null;
 let spotifyDeviceId  = null;
@@ -295,7 +314,6 @@ let spotifyTokenExpiry  = 0;
 let spotifyClientId  = '';
 let spotifyRedirectUri = '';
 
-// PKCE helpers
 function generateRandom(length) {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
   return Array.from(crypto.getRandomValues(new Uint8Array(length)), b => chars[b % chars.length]).join('');
@@ -307,7 +325,6 @@ async function pkceChallenge(verifier) {
 }
 
 async function connectSpotify() {
-  // Fetch client ID from server
   if (!spotifyClientId) {
     try {
       const r = await fetch('/api/spotify-config');
@@ -317,11 +334,10 @@ async function connectSpotify() {
     } catch(e) {}
   }
   if (!spotifyClientId) {
-    showToast('Spotify Client ID not set in .env', 'error');
+    showToast('Spotify Client ID not set — add it to Vercel env vars', 'error');
     return;
   }
 
-  // Generate PKCE verifier + challenge
   const verifier   = generateRandom(128);
   const challenge  = await pkceChallenge(verifier);
   sessionStorage.setItem('spotify_verifier', verifier);
@@ -333,7 +349,7 @@ async function connectSpotify() {
     scope:                 'streaming user-read-email user-read-private user-modify-playback-state user-read-playback-state',
     code_challenge_method: 'S256',
     code_challenge:        challenge,
-    state:                 socket.id   // so callback knows which socket to notify
+    state:                 myUserId
   });
 
   const popup = window.open(
@@ -343,7 +359,6 @@ async function connectSpotify() {
   if (!popup) showToast('Allow popups to connect Spotify', 'error');
 }
 
-// callback.html sends us the code via postMessage
 window.addEventListener('message', async (event) => {
   if (event.origin !== location.origin) return;
   if (event.data?.type !== 'spotify-callback') return;
@@ -352,7 +367,6 @@ window.addEventListener('message', async (event) => {
   const verifier = sessionStorage.getItem('spotify_verifier');
   if (!code || !verifier) { showToast('Spotify auth failed — no code/verifier', 'error'); return; }
 
-  // Exchange code for tokens (PKCE — no secret needed)
   try {
     const r = await fetch('https://accounts.spotify.com/api/token', {
       method: 'POST',
@@ -381,9 +395,8 @@ window.addEventListener('message', async (event) => {
 
 async function getSpotifyToken() {
   if (Date.now() < spotifyTokenExpiry) return spotifyToken;
-  // PKCE refresh — only needs client_id
   try {
-    const r = await fetch('/auth/spotify/refresh', {
+    const r = await fetch('/api/spotify-refresh', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ refreshToken: spotifyRefreshToken })
@@ -417,7 +430,6 @@ function initSpotifyPlayer() {
     spotifyReady = true;
     updatePlatformUI('spotify');
     showToast('Spotify connected!', 'success');
-    socket.emit('platform-ready', { platform: 'spotify' });
   });
 
   spotifyPlayer.addListener('not_ready', () => { spotifyReady = false; });
@@ -429,7 +441,6 @@ function initSpotifyPlayer() {
     updatePlayBtn(playing);
     setWaveform(playing);
 
-    // Update now-playing info from Spotify metadata
     const track = state.track_window?.current_track;
     if (track) {
       updateNowPlaying(track.name, track.artists?.[0]?.name, track.album?.images?.[0]?.url);
@@ -437,7 +448,6 @@ function initSpotifyPlayer() {
       document.getElementById('spotify-artist-name').textContent = track.artists?.map(a=>a.name).join(', ') || '';
     }
 
-    // Seekbar update for Spotify
     const pos = state.position / 1000;
     const dur = state.duration / 1000;
     if (dur > 0) {
@@ -448,16 +458,11 @@ function initSpotifyPlayer() {
       if (!seekDragging) { sb.value = pct; sb.style.setProperty('--progress', pct + '%'); }
     }
 
-    socket.emit('player-state', {
-      platform: 'spotify',
-      isPlaying: playing,
-      currentTime: pos,
-      lastUpdated: Date.now()
-    });
+    emitEvent('player-state', { platform: 'spotify', isPlaying: playing, currentTime: pos, lastUpdated: Date.now() });
   });
 
   spotifyPlayer.addListener('initialization_error', ({ message }) => showToast('Spotify init error: ' + message, 'error'));
-  spotifyPlayer.addListener('authentication_error', ({ message }) => showToast('Spotify auth error — reconnect Spotify', 'error'));
+  spotifyPlayer.addListener('authentication_error', () => showToast('Spotify auth error — reconnect Spotify', 'error'));
   spotifyPlayer.addListener('account_error', () => showToast('Spotify Premium required', 'error'));
 
   spotifyPlayer.connect();
@@ -505,14 +510,12 @@ async function toggleSpotifyPlayback() {
 
 function seekbarChangeSpotify(pct) {
   if (!spotifyPlayer || !spotifyReady) return;
-  // Spotify duration not easily available without state, use approximation
   spotifyPlayer.getCurrentState().then(state => {
     if (!state) return;
-    const dur = state.duration;
-    const posMs = (pct / 100) * dur;
+    const posMs = (pct / 100) * state.duration;
     isSyncing = true;
     spotifyPlayer.seek(posMs).then(() => {
-      socket.emit('player-state', { platform: 'spotify', isPlaying, currentTime: posMs/1000, lastUpdated: Date.now() });
+      emitEvent('player-state', { platform: 'spotify', isPlaying, currentTime: posMs/1000, lastUpdated: Date.now() });
       setTimeout(() => { isSyncing = false; }, 300);
     });
   });
@@ -531,7 +534,6 @@ async function connectAppleMusic() {
     const { developerToken } = await r.json();
     if (!developerToken) { showToast('Apple Music developer token not configured', 'error'); return; }
 
-    // Load MusicKit JS dynamically
     if (!window.MusicKit) {
       await new Promise((res, rej) => {
         const s = document.createElement('script');
@@ -551,14 +553,13 @@ async function connectAppleMusic() {
     updatePlatformUI('apple');
     showToast('Apple Music connected!', 'success');
 
-    // Listen for playback state changes
     appleMusicKit.addEventListener(MusicKit.Events.playbackStateDidChange, () => {
       if (isSyncing || currentPlatform !== 'apple') return;
       const playing = appleMusicKit.playbackState === MusicKit.PlaybackStates.playing;
       isPlaying = playing;
       updatePlayBtn(playing);
       setWaveform(playing);
-      socket.emit('player-state', {
+      emitEvent('player-state', {
         platform: 'apple',
         isPlaying: playing,
         currentTime: appleMusicKit.currentPlaybackTime,
@@ -628,10 +629,9 @@ async function toggleApplePlayback() {
 // ===== LOAD MEDIA (all platforms) =====
 // ===================================================
 async function loadMedia(mediaInfo) {
-  const { platform, videoId, uri, catalogId, url, title, thumbnail } = mediaInfo;
+  const { platform, videoId, uri, catalogId, title, thumbnail } = mediaInfo;
   currentPlatform = platform || 'youtube';
 
-  // Hide all wrappers
   document.getElementById('player-empty').style.display = 'none';
   document.getElementById('youtube-player-wrapper').style.display = 'none';
   document.getElementById('spotify-player-wrapper').style.display = 'none';
@@ -716,18 +716,18 @@ async function handleMediaLoad() {
   if (currentPlatform === 'youtube') {
     const vid = extractYtId(raw);
     if (vid) {
-      // Direct load
       let title = 'YouTube Video';
       let thumbnail = `https://img.youtube.com/vi/${vid}/mqdefault.jpg`;
       try {
         const r = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${vid}&format=json`);
         if (r.ok) { const d = await r.json(); title = d.title||title; thumbnail = d.thumbnail_url||thumbnail; }
       } catch(e) {}
-      socket.emit('load-media', { platform: 'youtube', videoId: vid, title, thumbnail });
+      const mediaInfo = { platform: 'youtube', videoId: vid, title, thumbnail, loadedBy: myName };
+      loadMedia(mediaInfo);
+      emitEvent('load-media', mediaInfo);
       document.getElementById('media-url-input').value = '';
       document.getElementById('search-results-panel').style.display = 'none';
     } else if (serverConfig.youtubeSearchEnabled) {
-      // Search
       searchYouTube(raw);
     } else {
       showToast('Invalid YouTube URL. Paste a full youtube.com or youtu.be link.', 'error');
@@ -736,22 +736,24 @@ async function handleMediaLoad() {
   } else if (currentPlatform === 'spotify') {
     if (!spotifyReady) { showToast('Connect your Spotify account first', 'error'); return; }
     if (!raw.includes('spotify.com')) { showToast('Paste a Spotify URL', 'error'); return; }
-    // Extract URI: open.spotify.com/track/ABC -> spotify:track:ABC
     const match = raw.match(/spotify\.com\/(track|album|playlist|artist)\/([a-zA-Z0-9]+)/);
     if (!match) { showToast('Invalid Spotify URL', 'error'); return; }
     const uri = `spotify:${match[1]}:${match[2]}`;
     const title = match[1].charAt(0).toUpperCase() + match[1].slice(1) + ' on Spotify';
-    socket.emit('load-media', { platform: 'spotify', videoId: '', uri, title, thumbnail: '' });
+    const mediaInfo = { platform: 'spotify', videoId: '', uri, title, thumbnail: '', loadedBy: myName };
+    loadMedia(mediaInfo);
+    emitEvent('load-media', mediaInfo);
     document.getElementById('media-url-input').value = '';
 
   } else if (currentPlatform === 'apple') {
     if (!appleReady) { showToast('Connect your Apple Music account first', 'error'); return; }
-    // Apple Music URL: music.apple.com/us/album/name/1234567?i=9876543
     const match = raw.match(/music\.apple\.com\/[^/]+\/(?:album|song|playlist)\/[^/]+\/(\d+)(?:\?i=(\d+))?/);
     if (!match) { showToast('Invalid Apple Music URL', 'error'); return; }
-    const catalogId = match[2] || match[1]; // track id or album id
+    const catalogId = match[2] || match[1];
     const title = 'Apple Music Track';
-    socket.emit('load-media', { platform: 'apple', videoId: '', catalogId, title, thumbnail: '' });
+    const mediaInfo = { platform: 'apple', videoId: '', catalogId, title, thumbnail: '', loadedBy: myName };
+    loadMedia(mediaInfo);
+    emitEvent('load-media', mediaInfo);
     document.getElementById('media-url-input').value = '';
   }
 }
@@ -761,7 +763,6 @@ document.getElementById('media-url-input').addEventListener('keydown', e => {
   if (e.key === 'Enter') handleMediaLoad();
 });
 
-// YouTube search with debounce
 let searchTimer = null;
 document.getElementById('media-url-input').addEventListener('input', function() {
   if (currentPlatform !== 'youtube' || !serverConfig.youtubeSearchEnabled) return;
@@ -802,25 +803,22 @@ function renderSearchResults(items) {
 window.loadYtSearch = (vid, title, thumb) => {
   document.getElementById('search-results-panel').style.display = 'none';
   document.getElementById('media-url-input').value = '';
-  socket.emit('load-media', { platform: 'youtube', videoId: vid, title, thumbnail: thumb });
+  const mediaInfo = { platform: 'youtube', videoId: vid, title, thumbnail: thumb, loadedBy: myName };
+  loadMedia(mediaInfo);
+  emitEvent('load-media', mediaInfo);
 };
 
-
-// ===== Platform connect UI =====
 function updatePlatformUI(platform) {
   const banner = document.getElementById('platform-connect-banner');
 
-  if (platform === 'youtube') {
-    banner.style.display = 'none';
-    return;
-  }
+  if (platform === 'youtube') { banner.style.display = 'none'; return; }
 
   if (platform === 'spotify') {
     if (!serverConfig.spotifyEnabled) {
       banner.style.display = 'block';
       banner.innerHTML = `<div class="connect-banner warn">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-        Spotify not configured. Add <code>SPOTIFY_CLIENT_ID</code> &amp; <code>SPOTIFY_CLIENT_SECRET</code> to <code>.env</code>
+        Spotify not configured. Add <code>SPOTIFY_CLIENT_ID</code> to Vercel env vars.
       </div>`;
     } else if (!spotifyReady) {
       banner.style.display = 'block';
@@ -843,7 +841,7 @@ function updatePlatformUI(platform) {
       banner.style.display = 'block';
       banner.innerHTML = `<div class="connect-banner warn">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-        Apple Music not configured. Add <code>APPLE_DEVELOPER_TOKEN</code> to <code>.env</code>
+        Apple Music not configured. Add <code>APPLE_DEVELOPER_TOKEN</code> to Vercel env vars.
       </div>`;
     } else if (!appleReady) {
       banner.style.display = 'block';
@@ -893,11 +891,11 @@ function renderQueue(queue) {
     </div>`).join('');
 }
 
-window.playQueueItem = id => socket.emit('queue-play', { itemId: id });
-window.removeQueueItem = id => socket.emit('queue-remove', { itemId: id });
+window.playQueueItem = id => emitEvent('queue-play', { itemId: id });
+window.removeQueueItem = id => emitEvent('queue-remove', { itemId: id });
 
 function playNextInQueue() {
-  if (queueData.length > 0) socket.emit('queue-play', { itemId: queueData[0].id });
+  if (queueData.length > 0) emitEvent('queue-play', { itemId: queueData[0].id });
 }
 
 
@@ -909,7 +907,7 @@ function renderUsers(users) {
     const init = (u.name||'?').substring(0,2).toUpperCase();
     const badges = [
       u.isHost ? `<span class="user-badge host">Host</span>` : '',
-      u.id === myId ? `<span class="user-badge you">You</span>` : '',
+      u.id === myUserId ? `<span class="user-badge you">You</span>` : '',
       u.voiceEnabled ? `<span class="user-badge voice">🎤</span>` : ''
     ].filter(Boolean).join('');
     return `<div class="user-card" data-id="${u.id}">
@@ -922,6 +920,32 @@ function renderUsers(users) {
   }).join('');
 }
 
+function buildUserList() {
+  if (!channel || !channel.members) return [];
+  const list = [];
+  let oldestAt = Infinity;
+  let hostId = null;
+
+  channel.members.each(member => {
+    const at = member.info?.joinedAt || 0;
+    if (at < oldestAt) { oldestAt = at; hostId = member.id; }
+  });
+
+  channel.members.each(member => {
+    const state = userStates.get(member.id) || {};
+    list.push({
+      id: member.id,
+      name: member.info?.name || 'Anonymous',
+      isHost: member.id === hostId,
+      voiceEnabled: state.voiceEnabled || false,
+      isSpeaking: state.isSpeaking || false,
+      isMuted: state.isMuted || false
+    });
+  });
+
+  return list;
+}
+
 
 // ===== CHAT =====
 function renderMessage(msg) {
@@ -930,7 +954,7 @@ function renderMessage(msg) {
     el.className = 'system-message';
     el.textContent = msg.message;
   } else {
-    el.className = `chat-message${msg.userId===myId?' own':''}`;
+    el.className = `chat-message${msg.userId===myUserId?' own':''}`;
     const col = userColor(msg.userId);
     const nameColor = col.includes('7c3aed') ? '#a78bfa' : col.includes('ec4899') ? '#f9a8d4' : col.includes('06b6d4') ? '#67e8f9' : '#86efac';
     const time = new Date(msg.timestamp).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
@@ -946,14 +970,14 @@ function sendChat() {
   const msg = inp.value.trim();
   if (!msg) return;
   inp.value = '';
-  socket.emit('chat-message', { message: msg });
+  emitEvent('chat-message', { message: msg, userId: myUserId, userName: myName });
 }
 
 document.getElementById('chat-send-btn').addEventListener('click', sendChat);
 document.getElementById('chat-input').addEventListener('keydown', e => { if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat();} });
 
 
-// ===== VOICE CHAT (WebRTC) =====
+// ===== VOICE CHAT (WebRTC via Pusher client events) =====
 let voiceEnabled = false, localStream = null;
 const peers = new Map();
 let audioCtx = null, speakDetect = null, isSpeakingNow = false;
@@ -970,7 +994,22 @@ async function toggleVoice() {
       document.getElementById('mic-off-icon').style.display = 'block';
       document.getElementById('voice-status-badge').style.display = 'flex';
       setupSpeakDetect();
-      socket.emit('voice-enable');
+
+      // Update own state
+      userStates.set(myUserId, { ...(userStates.get(myUserId) || {}), voiceEnabled: true });
+      renderUsers(buildUserList());
+
+      // Announce to others via Pusher client event
+      if (channel) channel.trigger('client-voice-enable', { fromId: myUserId });
+
+      // Connect to existing voice-enabled peers
+      // (using alphabetical ID comparison to decide who initiates, avoiding double connections)
+      channel?.members.each(member => {
+        if (member.id !== myUserId && userStates.get(member.id)?.voiceEnabled) {
+          if (myUserId < member.id && !peers.has(member.id)) createPeer(member.id, true);
+        }
+      });
+
       showToast('Voice chat enabled', 'success');
     } catch(e) { showToast('Mic access denied', 'error'); }
   } else {
@@ -983,7 +1022,11 @@ async function toggleVoice() {
     document.getElementById('mic-on-icon').style.display = 'block';
     document.getElementById('mic-off-icon').style.display = 'none';
     document.getElementById('voice-status-badge').style.display = 'none';
-    socket.emit('voice-disable');
+
+    userStates.set(myUserId, { ...(userStates.get(myUserId) || {}), voiceEnabled: false, isSpeaking: false });
+    renderUsers(buildUserList());
+
+    if (channel) channel.trigger('client-voice-disable', { fromId: myUserId });
   }
 }
 
@@ -998,7 +1041,11 @@ function setupSpeakDetect() {
       an.getByteFrequencyData(data);
       const avg = data.reduce((a,b)=>a+b,0)/data.length;
       const speaking = avg > 18;
-      if (speaking !== isSpeakingNow) { isSpeakingNow = speaking; socket.emit('speaking', { isSpeaking: speaking }); }
+      if (speaking !== isSpeakingNow) {
+        isSpeakingNow = speaking;
+        userStates.set(myUserId, { ...(userStates.get(myUserId) || {}), isSpeaking: speaking });
+        if (channel) channel.trigger('client-speaking', { fromId: myUserId, isSpeaking: speaking });
+      }
     }, 150);
   } catch(e) {}
 }
@@ -1008,9 +1055,21 @@ async function createPeer(targetId, initiator) {
   peers.set(targetId, pc);
   localStream?.getTracks().forEach(t => pc.addTrack(t, localStream));
   pc.ontrack = e => playAudio(targetId, e.streams[0]);
-  pc.onicecandidate = e => e.candidate && socket.emit('webrtc-ice', { targetId, candidate: e.candidate });
-  pc.onconnectionstatechange = () => { if (['disconnected','failed'].includes(pc.connectionState)) { pc.close(); peers.delete(targetId); removeAudio(targetId); } };
-  if (initiator) { const offer = await pc.createOffer(); await pc.setLocalDescription(offer); socket.emit('webrtc-offer', { targetId, offer }); }
+  pc.onicecandidate = e => {
+    if (e.candidate && channel) {
+      channel.trigger('client-webrtc-ice', { targetId, fromId: myUserId, candidate: e.candidate });
+    }
+  };
+  pc.onconnectionstatechange = () => {
+    if (['disconnected','failed'].includes(pc.connectionState)) {
+      pc.close(); peers.delete(targetId); removeAudio(targetId);
+    }
+  };
+  if (initiator) {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    if (channel) channel.trigger('client-webrtc-offer', { targetId, fromId: myUserId, offer });
+  }
   return pc;
 }
 
@@ -1058,139 +1117,238 @@ document.querySelectorAll('.mobile-tab').forEach(tab => {
 });
 
 
-// ===== SOCKET EVENTS =====
-socket.on('player-state', (state) => {
-  if (!state) return;
-  const p = state.platform || currentPlatform;
-  if (p === 'youtube') applyYTState(state);
-  else if (p === 'spotify') applySpotifyState(state);
-  else if (p === 'apple') applyAppleState(state);
-  updatePlayBtn(state.isPlaying);
-  setWaveform(state.isPlaying);
-  isPlaying = state.isPlaying;
-});
+// ===================================================
+// ===== PUSHER INIT (replaces Socket.io) =====
+// ===================================================
+function initPusher() {
+  return new Promise((resolve) => {
+    pusher = new Pusher(serverConfig.pusherKey, {
+      cluster: serverConfig.pusherCluster,
+      channelAuthorization: {
+        customHandler: async ({ socketId, channelName }, callback) => {
+          try {
+            const res = await fetch('/api/pusher/auth', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                socket_id: socketId,
+                channel_name: channelName,
+                user_id: myUserId,
+                user_name: myName
+              })
+            });
+            const auth = await res.json();
+            callback(null, auth);
+          } catch(e) {
+            callback(new Error('Pusher auth failed'), null);
+          }
+        }
+      }
+    });
 
-socket.on('load-media', (mediaInfo) => {
-  loadMedia(mediaInfo);
-  showToast(`Now loading: ${mediaInfo.title || 'New media'}`, 'success');
-});
+    channel = pusher.subscribe(`presence-room-${ROOM_ID}`);
 
-socket.on('queue-update', renderQueue);
-socket.on('chat-message', renderMessage);
-socket.on('system-message', renderMessage);
+    // ── Presence events ──
+    channel.bind('pusher:subscription_succeeded', (members) => {
+      renderUsers(buildUserList());
+      // Announce joined (saves system message to KV, notifies others)
+      emitEvent('user-joined', { userName: myName });
+      resolve();
+    });
 
-socket.on('user-joined', ({ users }) => renderUsers(users));
-socket.on('user-left', ({ userId, users }) => {
-  renderUsers(users);
-  const p = peers.get(userId); if (p) { p.close(); peers.delete(userId); } removeAudio(userId);
-});
-socket.on('user-voice-change', ({ users }) => renderUsers(users));
-socket.on('user-speaking', ({ userId, isSpeaking }) => {
-  document.querySelector(`.user-card[data-id="${userId}"] .user-avatar`)?.classList.toggle('speaking', isSpeaking);
-});
+    channel.bind('pusher:subscription_error', (err) => {
+      console.error('Pusher subscription error:', err);
+      showToast('Could not connect to room — check Pusher config', 'error');
+      resolve();
+    });
 
-// WebRTC
-socket.on('voice-peers', async ({ peers: peerIds }) => {
-  for (const id of peerIds) if (!peers.has(id)) await createPeer(id, true);
-});
-socket.on('webrtc-offer', async ({ fromId, offer }) => {
-  if (!voiceEnabled) return;
-  let pc = peers.get(fromId) || await createPeer(fromId, false);
-  await pc.setRemoteDescription(offer);
-  const ans = await pc.createAnswer();
-  await pc.setLocalDescription(ans);
-  socket.emit('webrtc-answer', { targetId: fromId, answer: ans });
-});
-socket.on('webrtc-answer', async ({ fromId, answer }) => { const p=peers.get(fromId); if(p) await p.setRemoteDescription(answer); });
-socket.on('webrtc-ice', async ({ fromId, candidate }) => { const p=peers.get(fromId); if(p&&candidate) try{await p.addIceCandidate(candidate);}catch(e){} });
+    channel.bind('pusher:member_added', () => {
+      renderUsers(buildUserList());
+    });
 
+    channel.bind('pusher:member_removed', (member) => {
+      // Clean up voice/WebRTC for departed user
+      const p = peers.get(member.id);
+      if (p) { p.close(); peers.delete(member.id); }
+      removeAudio(member.id);
+      userStates.delete(member.id);
+      renderUsers(buildUserList());
+    });
 
-// ===== SETUP ROOM =====
-function setupRoom(roomData) {
-  document.getElementById('room-layout').style.display = 'grid';
-  document.getElementById('header-room-name').textContent = roomData.name;
-  document.getElementById('header-room-code').textContent = ROOM_ID;
-  renderUsers(roomData.users);
-  renderQueue(roomData.queue);
-  roomData.messages.forEach(renderMessage);
-  if (roomData.playerState?.videoId || roomData.playerState?.uri || roomData.playerState?.catalogId) {
-    loadMedia(roomData.playerState);
-    setTimeout(() => {
-      const s = roomData.playerState;
-      if (s.platform==='youtube') applyYTState(s);
-      else if (s.platform==='spotify') applySpotifyState(s);
-      else if (s.platform==='apple') applyAppleState(s);
-    }, 2000);
-  }
-  // Initialize platform UI for youtube by default
-  updatePlatformUI('youtube');
+    // ── Playback events ──
+    channel.bind('player-state', (state) => {
+      if (!state) return;
+      const p = state.platform || currentPlatform;
+      if (p === 'youtube') applyYTState(state);
+      else if (p === 'spotify') applySpotifyState(state);
+      else if (p === 'apple') applyAppleState(state);
+      updatePlayBtn(state.isPlaying);
+      setWaveform(state.isPlaying);
+      isPlaying = state.isPlaying;
+    });
+
+    channel.bind('load-media', (mediaInfo) => {
+      loadMedia(mediaInfo);
+      showToast(`Now loading: ${mediaInfo.title || 'New media'}`, 'success');
+    });
+
+    channel.bind('queue-update', renderQueue);
+    channel.bind('chat-message', renderMessage);
+    channel.bind('system-message', renderMessage);
+
+    // ── Client events: voice ──
+    channel.bind('client-voice-enable', ({ fromId }) => {
+      const state = userStates.get(fromId) || {};
+      userStates.set(fromId, { ...state, voiceEnabled: true });
+      renderUsers(buildUserList());
+      // If I'm in voice and the new peer has a higher ID, I initiate
+      if (voiceEnabled && fromId && myUserId < fromId && !peers.has(fromId)) {
+        createPeer(fromId, true);
+      }
+    });
+
+    channel.bind('client-voice-disable', ({ fromId }) => {
+      const state = userStates.get(fromId) || {};
+      userStates.set(fromId, { ...state, voiceEnabled: false, isSpeaking: false });
+      const p = peers.get(fromId);
+      if (p) { p.close(); peers.delete(fromId); removeAudio(fromId); }
+      renderUsers(buildUserList());
+    });
+
+    channel.bind('client-speaking', ({ fromId, isSpeaking }) => {
+      const state = userStates.get(fromId) || {};
+      userStates.set(fromId, { ...state, isSpeaking });
+      document.querySelector(`.user-card[data-id="${fromId}"] .user-avatar`)?.classList.toggle('speaking', isSpeaking);
+    });
+
+    // ── Client events: WebRTC signaling ──
+    channel.bind('client-webrtc-offer', async ({ targetId, fromId, offer }) => {
+      if (targetId !== myUserId || !voiceEnabled) return;
+      let pc = peers.get(fromId) || await createPeer(fromId, false);
+      await pc.setRemoteDescription(offer);
+      const ans = await pc.createAnswer();
+      await pc.setLocalDescription(ans);
+      channel.trigger('client-webrtc-answer', { targetId: fromId, fromId: myUserId, answer: ans });
+    });
+
+    channel.bind('client-webrtc-answer', async ({ targetId, fromId, answer }) => {
+      if (targetId !== myUserId) return;
+      const pc = peers.get(fromId);
+      if (pc) await pc.setRemoteDescription(answer);
+    });
+
+    channel.bind('client-webrtc-ice', async ({ targetId, fromId, candidate }) => {
+      if (targetId !== myUserId) return;
+      const pc = peers.get(fromId);
+      if (pc && candidate) try { await pc.addIceCandidate(candidate); } catch(e) {}
+    });
+  });
 }
 
+
+// ===================================================
+// ===== INIT =====
+// ===================================================
 function showNameOverlay(onName) {
   document.getElementById('name-overlay').style.display = 'flex';
   const btn = document.getElementById('overlay-join-btn');
   const inp = document.getElementById('overlay-username');
   const err = document.getElementById('overlay-error');
   const submit = () => {
-    const name = inp.value.trim(); if (!name) { inp.focus(); return; }
-    myName = name; sessionStorage.setItem('syncwave_username', name);
-    err.style.display = 'none'; onName(name);
+    const name = inp.value.trim();
+    if (!name) { inp.focus(); return; }
+    myName = name;
+    sessionStorage.setItem('syncwave_username', name);
+    err.style.display = 'none';
+    onName(name);
   };
   btn.addEventListener('click', submit);
   inp.addEventListener('keydown', e => { if(e.key==='Enter') submit(); });
   setTimeout(() => inp.focus(), 100);
 }
 
-function enterRoom(roomId, name) {
-  socket.emit('join-room', { roomId, userName: name }, res => {
-    if (!res.success) {
-      document.getElementById('name-overlay').style.display = 'flex';
-      const err = document.getElementById('overlay-error');
-      err.textContent = res.error || 'Could not join room.';
-      err.style.display = 'block';
+async function startRoom() {
+  document.getElementById('name-overlay').style.display = 'none';
+
+  // Verify room exists and get initial state
+  let roomData;
+  try {
+    const res = await fetch(`/api/rooms?id=${ROOM_ID}`);
+    if (!res.ok) {
+      showToast('Room not found', 'error');
+      setTimeout(() => location.href = '/', 2000);
       return;
     }
-    document.getElementById('name-overlay').style.display = 'none';
-    setupRoom(res.roomData);
-  });
+    roomData = await res.json();
+  } catch(e) {
+    showToast('Could not reach server', 'error');
+    return;
+  }
+
+  // Render static room UI
+  document.getElementById('room-layout').style.display = 'grid';
+  document.getElementById('header-room-name').textContent = roomData.name || ROOM_ID;
+  document.getElementById('header-room-code').textContent = ROOM_ID;
+  renderQueue(roomData.queue || []);
+  (roomData.messages || []).forEach(renderMessage);
+
+  // Connect to Pusher presence channel
+  await initPusher();
+
+  // Restore current media if room has an active track
+  const s = roomData.playerState;
+  if (s && (s.videoId || s.uri || s.catalogId)) {
+    loadMedia(s);
+    setTimeout(() => {
+      if (s.platform === 'youtube') applyYTState(s);
+      else if (s.platform === 'spotify') applySpotifyState(s);
+      else if (s.platform === 'apple') applyAppleState(s);
+    }, 2000);
+  }
+
+  updatePlatformUI('youtube');
 }
 
-function createAndEnterRoom(name, roomName) {
-  document.getElementById('name-overlay').style.display = 'none';
-  socket.emit('create-room', { userName: name, roomName }, res => {
-    if (!res.success) { showToast('Failed to create room', 'error'); setTimeout(()=>location.href='/',1500); return; }
-    ROOM_ID = res.roomId;
-    history.replaceState({}, '', `/room.html?id=${res.roomId}`);
-    setupRoom(res.roomData);
-  });
-}
-
-
-// ===== INIT =====
 async function init() {
-  // Load server config to know which platforms are set up
+  // Fetch server config (includes Pusher key/cluster)
   try {
     const r = await fetch('/api/config');
     serverConfig = await r.json();
   } catch(e) {}
 
-  const savedName = sessionStorage.getItem('syncwave_username');
-
   if (IS_CREATING) {
-    if (!savedName) { location.href = '/'; return; }
-    myName = savedName;
+    myName = sessionStorage.getItem('syncwave_username');
+    if (!myName) { location.href = '/'; return; }
     const roomName = sessionStorage.getItem('syncwave_create_roomname') || `${myName}'s Room`;
     sessionStorage.removeItem('syncwave_create_roomname');
-    createAndEnterRoom(myName, roomName);
+
+    try {
+      const res = await fetch('/api/rooms', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'create', userName: myName, roomName })
+      });
+      const data = await res.json();
+      if (!data.success) { showToast('Failed to create room', 'error'); setTimeout(() => location.href = '/', 1500); return; }
+      ROOM_ID = data.roomId;
+      history.replaceState({}, '', `/room.html?id=${ROOM_ID}`);
+    } catch(e) {
+      showToast('Server error — could not create room', 'error');
+      return;
+    }
+    await startRoom();
+
   } else if (ROOM_ID) {
-    if (savedName) { myName = savedName; enterRoom(ROOM_ID, myName); }
-    else showNameOverlay(name => enterRoom(ROOM_ID, name));
+    myName = sessionStorage.getItem('syncwave_username');
+    if (myName) {
+      await startRoom();
+    } else {
+      showNameOverlay(async () => { await startRoom(); });
+    }
+
   } else {
     location.href = '/';
   }
 }
 
-let domReady = false, sockReady = false;
-function tryInit() { if (domReady && sockReady) init(); }
-socket.on('connect', () => { myId = socket.id; sockReady = true; tryInit(); });
-document.addEventListener('DOMContentLoaded', () => { domReady = true; tryInit(); });
+document.addEventListener('DOMContentLoaded', init);

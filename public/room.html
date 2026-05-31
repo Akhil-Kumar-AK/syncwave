@@ -314,8 +314,8 @@
     ytTag.src = 'https://www.youtube.com/iframe_api';
     document.head.appendChild(ytTag);
   </script>
-  <!-- Apple MusicKit JS (loaded conditionally by room.js) -->
-  <script src="/socket.io/socket.io.js"></script>
+  <!-- Pusher JS (replaces Socket.io for serverless Vercel deployment) -->
+  <script src="https://js.pusher.com/8.4.0/pusher.min.js"></script>
   <script src="/js/room.js"></script>
 </body>
 </html>

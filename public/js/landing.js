@@ -1,7 +1,5 @@
 'use strict';
 
-const socket = io();
-
 // Utility: show toast
 function showToast(message, type = 'info') {
   const container = document.getElementById('toast-container');
@@ -25,33 +23,26 @@ function showToast(message, type = 'info') {
 function openModal(id) {
   const modal = document.getElementById(id);
   modal.style.display = 'flex';
-  // Focus first input
   const input = modal.querySelector('input');
   if (input) setTimeout(() => input.focus(), 50);
 }
-
 function closeModal(id) {
-  const modal = document.getElementById(id);
-  modal.style.display = 'none';
+  document.getElementById(id).style.display = 'none';
 }
 
-// Close on overlay click
 document.querySelectorAll('.modal-overlay').forEach(overlay => {
   overlay.addEventListener('click', (e) => {
     if (e.target === overlay) closeModal(overlay.id);
   });
 });
-
-// Close buttons
 document.querySelectorAll('.modal-close').forEach(btn => {
   btn.addEventListener('click', () => closeModal(btn.dataset.close));
 });
 
-// Open modals
 document.getElementById('create-card').addEventListener('click', () => openModal('create-modal'));
 document.getElementById('join-card').addEventListener('click', () => openModal('join-modal'));
 
-// Create Room
+// ── Create Room ──
 document.getElementById('create-btn').addEventListener('click', createRoom);
 document.getElementById('create-roomname').addEventListener('keydown', e => { if (e.key === 'Enter') createRoom(); });
 document.getElementById('create-username').addEventListener('keydown', e => { if (e.key === 'Enter') document.getElementById('create-roomname').focus(); });
@@ -67,33 +58,29 @@ function createRoom() {
     return;
   }
 
-  // Store in sessionStorage and let room.html create the room on its own socket
+  // Store name and room info — room.html creates the room via API on its own init
   sessionStorage.setItem('syncwave_username', userName);
   sessionStorage.setItem('syncwave_create_roomname', roomName || `${userName}'s Room`);
   window.location.href = '/room.html?create=true';
 }
 
-// Join Room
+// ── Join Room ──
 document.getElementById('join-btn').addEventListener('click', joinRoom);
 document.getElementById('join-roomcode').addEventListener('keydown', e => { if (e.key === 'Enter') joinRoom(); });
 document.getElementById('join-username').addEventListener('keydown', e => { if (e.key === 'Enter') document.getElementById('join-roomcode').focus(); });
 
-// Auto-uppercase room code
 document.getElementById('join-roomcode').addEventListener('input', function() {
   this.value = this.value.toUpperCase().replace(/[^A-Z0-9]/g, '');
 });
 
-function joinRoom() {
+async function joinRoom() {
   const userName = document.getElementById('join-username').value.trim();
   const roomId = document.getElementById('join-roomcode').value.trim().toUpperCase();
   const errorEl = document.getElementById('join-error');
 
   errorEl.style.display = 'none';
 
-  if (!userName) {
-    document.getElementById('join-username').focus();
-    return;
-  }
+  if (!userName) { document.getElementById('join-username').focus(); return; }
   if (!roomId || roomId.length < 4) {
     document.getElementById('join-roomcode').focus();
     errorEl.textContent = 'Please enter a valid room code.';
@@ -103,23 +90,34 @@ function joinRoom() {
 
   const btn = document.getElementById('join-btn');
   btn.disabled = true;
-  btn.textContent = 'Joining...';
+  btn.textContent = 'Checking...';
 
-  sessionStorage.setItem('syncwave_username', userName);
+  try {
+    const res = await fetch('/api/rooms', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'check', roomId })
+    });
+    const data = await res.json();
 
-  socket.emit('join-room', { userName, roomId }, (res) => {
-    btn.disabled = false;
-    btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 012 2v14a2 2 0 01-2 2h-4M10 17l5-5-5-5M15 12H3"/></svg>Join Room`;
-    if (res.success) {
+    if (data.success) {
+      sessionStorage.setItem('syncwave_username', userName);
       window.location.href = `/room.html?id=${roomId}`;
     } else {
-      errorEl.textContent = res.error || 'Could not join room.';
+      errorEl.textContent = data.error || 'Could not join room.';
       errorEl.style.display = 'block';
+      btn.disabled = false;
+      btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 012 2v14a2 2 0 01-2 2h-4M10 17l5-5-5-5M15 12H3"/></svg>Join Room`;
     }
-  });
+  } catch(e) {
+    errorEl.textContent = 'Connection error. Please try again.';
+    errorEl.style.display = 'block';
+    btn.disabled = false;
+    btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 012 2v14a2 2 0 01-2 2h-4M10 17l5-5-5-5M15 12H3"/></svg>Join Room`;
+  }
 }
 
-// Check if there's a room ID in URL (e.g., from shared link)
+// Pre-fill room code from shared link (?room=XXXXX)
 const urlParams = new URLSearchParams(window.location.search);
 const sharedRoomId = urlParams.get('room');
 if (sharedRoomId) {
