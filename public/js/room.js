@@ -330,7 +330,8 @@ async function connectSpotify() {
       const r = await fetch('/api/spotify-config');
       const d = await r.json();
       spotifyClientId   = d.clientId;
-      spotifyRedirectUri = d.redirectUri;
+      // Always derive redirect URI from the actual browser URL — never trust server-constructed URLs
+      spotifyRedirectUri = `${location.origin}/callback.html`;
     } catch(e) {}
   }
   if (!spotifyClientId) {
