@@ -48,8 +48,8 @@ module.exports = async function handler(req, res) {
       room.messages.push(msg);
       if (room.messages.length > 100) room.messages = room.messages.slice(-100);
       await kv.set(`room:${rid}`, room, { ex: 86400 });
-      // Send load-media to everyone (including sender) so UI updates
-      await pusher.trigger(channel, 'load-media', room.playerState);
+      // Exclude sender — they already loaded locally before calling this endpoint
+      await pusher.trigger(channel, 'load-media', room.playerState, options);
       await pusher.trigger(channel, 'system-message', msg);
 
     } else if (event === 'chat-message') {
