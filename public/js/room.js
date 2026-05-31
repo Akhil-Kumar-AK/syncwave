@@ -134,9 +134,33 @@ window.onYouTubeIframeAPIReady = function () {
   ytPlayer = new YT.Player('youtube-player', {
     height: '100%', width: '100%', videoId: '',
     playerVars: { controls: 1, rel: 0, modestbranding: 1, iv_load_policy: 3, origin: location.origin },
-    events: { onReady: onYTReady, onStateChange: onYTStateChange }
+    events: { onReady: onYTReady, onStateChange: onYTStateChange, onError: onYTError }
   });
 };
+
+function onYTError(event) {
+  const code = event.data;
+  const messages = {
+    2:   'Invalid video ID.',
+    5:   'This video cannot be played in the browser.',
+    100: 'Video not found or private.',
+    101: 'This video cannot be embedded — the uploader disabled it. Try a different video.',
+    150: 'This video cannot be embedded — the uploader disabled it. Try a different video.'
+  };
+  const msg = messages[code] || `YouTube error ${code} — try a different video.`;
+  showToast(msg, 'error');
+  // Show hint in player area
+  const wrapper = document.getElementById('youtube-player-wrapper');
+  const hint = document.getElementById('yt-embed-hint');
+  if (!hint && wrapper) {
+    const el = document.createElement('div');
+    el.id = 'yt-embed-hint';
+    el.style.cssText = 'position:absolute;bottom:12px;left:0;right:0;text-align:center;color:#f87171;font-size:13px;padding:0 16px;pointer-events:none;';
+    el.textContent = '⚠️ This video blocked embedding — paste a different YouTube URL above';
+    wrapper.appendChild(el);
+    setTimeout(() => el.remove(), 8000);
+  }
+}
 
 function onYTReady() {
   ytReady = true;
