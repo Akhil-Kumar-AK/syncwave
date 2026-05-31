@@ -1122,6 +1122,13 @@ document.querySelectorAll('.mobile-tab').forEach(tab => {
 // ===================================================
 function initPusher() {
   return new Promise((resolve) => {
+    if (!serverConfig.pusherKey) {
+      showToast('Pusher not configured — add PUSHER_KEY to Vercel env vars', 'error');
+      // Still show the current user locally so the UI isn't empty
+      renderUsers([{ id: myUserId, name: myName, isHost: true, voiceEnabled: false, isSpeaking: false, isMuted: false }]);
+      return resolve();
+    }
+
     pusher = new Pusher(serverConfig.pusherKey, {
       cluster: serverConfig.pusherCluster,
       channelAuthorization: {
@@ -1137,19 +1144,45 @@ function initPusher() {
                 user_name: myName
               })
             });
+            if (!res.ok) {
+              const err = await res.json().catch(() => ({}));
+              console.error('Pusher auth endpoint error:', res.status, err);
+              callback(new Error(`Auth HTTP ${res.status}: ${err.error || 'unknown'}`), null);
+              return;
+            }
             const auth = await res.json();
             callback(null, auth);
           } catch(e) {
-            callback(new Error('Pusher auth failed'), null);
+            console.error('Pusher auth fetch error:', e);
+            callback(e, null);
           }
         }
       }
     });
 
+    // Log connection state changes for debugging
+    pusher.connection.bind('state_change', ({ current }) => {
+      console.log('Pusher connection:', current);
+      if (current === 'failed' || current === 'unavailable') {
+        showToast('Pusher connection failed — check PUSHER_KEY/CLUSTER env vars', 'error');
+        renderUsers([{ id: myUserId, name: myName, isHost: true, voiceEnabled: false, isSpeaking: false, isMuted: false }]);
+        resolve();
+      }
+    });
+
+    // Timeout fallback — if subscription never fires after 12s, unblock startup
+    const timer = setTimeout(() => {
+      console.warn('Pusher subscription timed out');
+      showToast('Room sync slow — check Pusher env vars in Vercel', 'error');
+      renderUsers([{ id: myUserId, name: myName, isHost: true, voiceEnabled: false, isSpeaking: false, isMuted: false }]);
+      resolve();
+    }, 12000);
+
     channel = pusher.subscribe(`presence-room-${ROOM_ID}`);
 
     // ── Presence events ──
     channel.bind('pusher:subscription_succeeded', (members) => {
+      clearTimeout(timer);
       renderUsers(buildUserList());
       // Announce joined (saves system message to KV, notifies others)
       emitEvent('user-joined', { userName: myName });
@@ -1157,8 +1190,10 @@ function initPusher() {
     });
 
     channel.bind('pusher:subscription_error', (err) => {
+      clearTimeout(timer);
       console.error('Pusher subscription error:', err);
-      showToast('Could not connect to room — check Pusher config', 'error');
+      showToast('Room sync failed — check Pusher env vars in Vercel', 'error');
+      renderUsers([{ id: myUserId, name: myName, isHost: true, voiceEnabled: false, isSpeaking: false, isMuted: false }]);
       resolve();
     });
 
