@@ -1,4 +1,4 @@
-const { kv } = require('@vercel/kv');
+const { kv } = require('./_kv');
 const Pusher = require('pusher');
 const { v4: uuidv4 } = require('uuid');
 
