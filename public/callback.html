@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Connecting...</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet" />
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #060614; color: white;
+      font-family: 'Inter', sans-serif;
+      display: flex; align-items: center; justify-content: center;
+      height: 100vh;
+    }
+    .card { text-align: center; padding: 48px 40px; }
+    .icon { font-size: 3rem; margin-bottom: 16px; }
+    h2 { font-size: 1.3rem; font-weight: 700; margin-bottom: 8px; }
+    p { color: #94a3b8; font-size: 0.9rem; }
+    .spinner {
+      width: 36px; height: 36px; border: 3px solid rgba(255,255,255,0.1);
+      border-top-color: #1db954; border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      margin: 0 auto 20px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="card" id="card">
+    <div class="spinner"></div>
+    <h2>Connecting to Spotify...</h2>
+    <p>This window will close automatically.</p>
+  </div>
+
+  <script>
+    const params = new URLSearchParams(location.search);
+    const code  = params.get('code');
+    const error = params.get('error');
+    const state = params.get('state'); // socket ID passed as state
+
+    if (error || !code) {
+      document.getElementById('card').innerHTML = `
+        <div class="icon">✗</div>
+        <h2 style="color:#ef4444">Auth Failed</h2>
+        <p>${error || 'No code received'}</p>`;
+      setTimeout(() => window.close(), 3000);
+    } else {
+      // Send code back to the opener window via postMessage (same origin)
+      if (window.opener) {
+        window.opener.postMessage({ type: 'spotify-callback', code, state }, location.origin);
+        document.getElementById('card').innerHTML = `
+          <div class="icon" style="color:#1db954">✓</div>
+          <h2>Spotify Connected!</h2>
+          <p>This window will close automatically...</p>`;
+        setTimeout(() => window.close(), 1200);
+      } else {
+        // Fallback: no opener (e.g. redirect instead of popup)
+        document.getElementById('card').innerHTML = `
+          <div class="icon">⚠</div>
+          <h2>Popup was blocked</h2>
+          <p>Please allow popups and try again.</p>`;
+      }
+    }
+  </script>
+</body>
+</html>
